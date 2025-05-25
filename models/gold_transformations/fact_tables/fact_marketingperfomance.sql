@@ -1,50 +1,87 @@
-{{
-  config(
-    materialized = 'incremental',
-    unique_key = 'SalesKey',
-    constraints = {
-      'primary_key': ['SalesKey']
-    }
-  )
-}}
+WITH campaign_sales AS (
+    SELECT
+        dm.campaign_key,
+        fs.CustomerKey,
+        fs.order_date,
+        fs.TotalSalesAmount,
+
+        -- First purchase date per customer overall
+        MIN(fs.order_date) OVER (PARTITION BY fs.CustomerKey) AS first_purchase_date,
+
+        dm.end_date
+
+    FROM {{ ref('facts_sales') }} fs
+    JOIN {{ ref('dim_marketingcampaign') }} dm
+      ON fs.CampaignKey = dm.campaign_key
+    WHERE fs.order_date BETWEEN dm.start_date AND dm.end_date
+),
+
+-- Total Sales Influenced by Campaign
+sales_influenced AS (
+    SELECT
+        campaign_key,
+        SUM(TotalSalesAmount) AS total_sales_influenced
+    FROM campaign_sales
+    GROUP BY campaign_key
+),
+
+-- New Customers Acquired (first purchase during campaign)
+new_customers AS (
+    SELECT
+        campaign_key,
+        COUNT(DISTINCT CustomerKey) AS new_customers_acquired
+    FROM campaign_sales
+    WHERE order_date = first_purchase_date
+    GROUP BY campaign_key
+),
+
+-- Repeat Purchasers: customers who purchased during campaign AND again after campaign end date
+repeat_purchasers AS (
+    SELECT DISTINCT
+        cs.campaign_key,
+        cs.CustomerKey
+    FROM campaign_sales cs
+    JOIN {{ ref('facts_sales') }} fs2
+      ON cs.CustomerKey = fs2.CustomerKey
+    JOIN {{ ref('dim_marketingcampaign') }} dm2
+      ON cs.campaign_key = dm2.campaign_key
+    WHERE fs2.order_date > dm2.end_date
+),
+
+-- Repeat metrics: count first time customers & repeat purchasers
+repeat_metrics AS (
+    SELECT
+        cs.campaign_key,
+        COUNT(DISTINCT CASE WHEN cs.order_date = cs.first_purchase_date THEN cs.CustomerKey END) AS first_time_customers,
+        COUNT(DISTINCT rp.CustomerKey) AS repeat_purchasers
+    FROM campaign_sales cs
+    LEFT JOIN repeat_purchasers rp ON cs.campaign_key = rp.campaign_key AND cs.CustomerKey = rp.CustomerKey
+    GROUP BY cs.campaign_key
+)
 
 SELECT
-    MD5(CONCAT(od.order_id, od.customer_id, dp.product_id, od.store_id, od.employee_id, od.campaign_id)) AS SalesKey,
-    od.order_id AS OrderID,
-    od.customer_id AS CustomerKey,
-    dp.product_id AS ProductKey,
-    od.store_id AS StoreKey,
-    od.order_date as order_date,
-    MD5(TO_CHAR(od.order_date, 'YYYY-MM-DD')) AS DateKey,
-    od.employee_id AS EmployeeKey,
-    od.campaign_id AS CampaignKey,
-    SUM(od.quantity) AS QuantitySold,
-    AVG(od.unit_price) AS UnitPrice,
-    SUM(od.total__sales_amount) AS TotalSalesAmount,
-    SUM(od.quantity * dp.cost_price) AS CostAmount,
-    SUM(od.quantity * od.unit_price - od.quantity * dp.cost_price - od.discount_amount - od.shipping_cost) AS ProfitAmount,
-    SUM(od.discount_amount) AS DiscountAmount,
-    SUM(od.shipping_cost) AS ShippingCost,
-    SPLIT_PART(SPLIT_PART(dc.address_details, ',', 3), ' ', 2) AS Region,
+    dm.campaign_key,
+    dm.start_date,
+    dm.end_date,
+    dm.budget,
+
+    COALESCE(si.total_sales_influenced,0) AS total_sales_influenced,
+    COALESCE(nc.new_customers_acquired,0) AS new_customers_acquired,
+
     CASE 
-        WHEN od.order_source IN ('website', 'mobile_app') THEN 'Online'
-        ELSE 'In-Store'
-    END AS SalesChannel,
-    dc.segment AS CustomerSegmentImpact
-FROM DBT_SAIFSHAHUL_NEW_DATA.STG_ORDERS AS od
-JOIN DBT_SAIFSHAHUL_NEW_DATA.dim_product AS dp ON od.product_id = dp.product_id
-JOIN DBT_SAIFSHAHUL_NEW_DATA.dim_customer AS dc ON od.customer_id = dc.customer_id
-GROUP BY 
-    od.order_id, 
-    od.customer_id, 
-    dp.product_id, 
-    od.store_id, 
-    od.employee_id, 
-    od.campaign_id, 
-    od.order_date,
-    SPLIT_PART(SPLIT_PART(dc.address_details, ',', 3), ' ', 2) , 
+        WHEN rm.first_time_customers = 0 THEN NULL
+        ELSE ROUND((rm.repeat_purchasers * 100.0) / rm.first_time_customers, 2)
+    END AS repeat_purchase_rate,
+
     CASE 
-        WHEN od.order_source IN ('website', 'mobile_app') THEN 'Online'
-        ELSE 'In-Store'
-    END, 
-    dc.segment
+        WHEN dm.budget = 0 THEN NULL
+        ELSE ROUND(((COALESCE(si.total_sales_influenced,0) - dm.budget) / dm.budget) * 100, 2)
+    END AS roi_metrics
+
+FROM {{ ref('dim_marketingcampaign') }} dm
+LEFT JOIN sales_influenced si ON dm.campaign_key = si.campaign_key
+LEFT JOIN new_customers nc ON dm.campaign_key = nc.campaign_key
+LEFT JOIN repeat_metrics rm ON dm.campaign_key = rm.campaign_key
+
+ORDER BY dm.campaign_key
+
