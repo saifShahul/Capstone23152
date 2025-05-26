@@ -68,14 +68,14 @@ SELECT
     COALESCE(si.total_sales_influenced,0) AS total_sales_influenced,
     COALESCE(nc.new_customers_acquired,0) AS new_customers_acquired,
 
-    CASE 
-        WHEN rm.first_time_customers = 0 THEN NULL
+    /*CASE 
+        WHEN rm.first_time_customers = 0 THEN 0
         ELSE ROUND((rm.repeat_purchasers * 100.0) / rm.first_time_customers, 2)
-    END AS repeat_purchase_rate,
+    END AS repeat_purchase_rate,*/
 
     CASE 
         WHEN dm.budget = 0 THEN NULL
-        ELSE ROUND(((COALESCE(si.total_sales_influenced,0) - dm.budget) / dm.budget) * 100, 2)
+        ELSE -(ROUND(((COALESCE(si.total_sales_influenced,0) - dm.budget) / dm.budget) * 100, 2))
     END AS roi_metrics
 
 FROM {{ ref('dim_marketingcampaign') }} dm
